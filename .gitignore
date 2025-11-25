@@ -1,2 +1,4 @@
 out
 assets/
+.env
+chirpy
