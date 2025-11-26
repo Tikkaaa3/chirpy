@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Tikkaaa3/chirpy/internal/auth"
 	"github.com/Tikkaaa3/chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -31,7 +32,8 @@ type User struct {
 
 func (cfg *apiConfig) userCreateHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Email string `json:"email"`
+		Password string `"json:password"`
+		Email    string `json:"email"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -42,7 +44,17 @@ func (cfg *apiConfig) userCreateHandler(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(500)
 		return
 	}
-	user, err := cfg.dbQueries.CreateUser(r.Context(), params.Email)
+	hash, err := auth.HashPassword(params.Password)
+	if err != nil {
+		log.Printf("Error hashing password: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	user, err := cfg.dbQueries.CreateUser(r.Context(), database.CreateUserParams{
+		Email:          params.Email,
+		HashedPassword: hash})
+
 	if err != nil {
 		log.Printf("Error creating user: %s", err)
 		w.WriteHeader(500)
@@ -65,6 +77,56 @@ func (cfg *apiConfig) userCreateHandler(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(201)
 	w.Write(dat)
 
+}
+
+func (cfg *apiConfig) userLoginHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `"json:password"`
+		Email    string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		log.Printf("Error decoding parameters: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	if params.Password == "" {
+		w.WriteHeader(401)
+		return
+	}
+	user, err := cfg.dbQueries.GetUser(r.Context(), params.Email)
+	if err != nil {
+		log.Printf("%s", err)
+		w.WriteHeader(401)
+		return
+	}
+
+	match, err := auth.CheckPasswordHash(params.Password, user.HashedPassword)
+	if err != nil {
+		log.Printf("Error checking password: %s", err)
+		w.WriteHeader(401)
+		return
+	}
+	if match {
+		dat, err := json.Marshal(User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		})
+		if err != nil {
+			fmt.Println(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(dat)
+	} else {
+		w.WriteHeader(401)
+	}
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -276,6 +338,8 @@ func main() {
 
 	// Create user
 	mux.HandleFunc("POST /api/users", apiCfg.userCreateHandler)
+	// Get user
+	mux.HandleFunc("POST /api/login", apiCfg.userLoginHandler)
 
 	// Chirp
 	mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
