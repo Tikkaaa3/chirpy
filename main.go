@@ -21,13 +21,16 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
 	platform       string
+	secret         string
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func (cfg *apiConfig) userCreateHandler(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +84,7 @@ func (cfg *apiConfig) userCreateHandler(w http.ResponseWriter, r *http.Request) 
 
 func (cfg *apiConfig) userLoginHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Password string `"json:password"`
+		Password string `json:"password"`
 		Email    string `json:"email"`
 	}
 
@@ -98,6 +101,7 @@ func (cfg *apiConfig) userLoginHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)
 		return
 	}
+
 	user, err := cfg.dbQueries.GetUser(r.Context(), params.Email)
 	if err != nil {
 		log.Printf("%s", err)
@@ -112,11 +116,29 @@ func (cfg *apiConfig) userLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if match {
+		accessToken, err := auth.MakeJWT(user.ID, cfg.secret, time.Hour)
+		if err != nil {
+			log.Printf("Error getting token: %s", err)
+			return
+		}
+
+		refreshToken, _ := auth.MakeRefreshToken()
+		refreshParams := database.CreateRefreshTokenParams{
+			Token: refreshToken,
+			UserID: uuid.NullUUID{
+				UUID:  user.ID,
+				Valid: true,
+			}, ExpiresAt: time.Now().Add(60 * 24 * time.Hour)}
+
+		_, _ = cfg.dbQueries.CreateRefreshToken(r.Context(), refreshParams)
+
 		dat, err := json.Marshal(User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+			ID:           user.ID,
+			CreatedAt:    user.CreatedAt,
+			UpdatedAt:    user.UpdatedAt,
+			Email:        user.Email,
+			Token:        accessToken,
+			RefreshToken: refreshToken,
 		})
 		if err != nil {
 			fmt.Println(err)
@@ -219,6 +241,41 @@ func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(dat)
 }
 
+func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, r *http.Request) {
+	token, _ := auth.GetBearerToken(r.Header)
+	user, err := cfg.dbQueries.GetUserFromRefreshToken(r.Context(), token)
+	jwt, _ := auth.MakeJWT(user.ID, cfg.secret, time.Hour)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	type resBody struct {
+		Token string `json:"token"`
+	}
+	res := resBody{
+		Token: jwt,
+	}
+	dat, err := json.Marshal(res)
+	if err != nil {
+		fmt.Println(err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(dat)
+
+}
+
+func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request) {
+	token, _ := auth.GetBearerToken(r.Header)
+	_, err := cfg.dbQueries.RevokeRefreshToken(r.Context(), token)
+	if err != nil {
+		w.WriteHeader(401)
+	}
+
+	w.WriteHeader(204)
+
+}
+
 func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 	type bodyParams struct {
 		Body   string        `json:"body"`
@@ -260,9 +317,23 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 			UserID    uuid.NullUUID `json:"user_id"`
 		}
 
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("%s", err)
+			w.WriteHeader(500)
+			return
+		}
+		id, err := auth.ValidateJWT(token, cfg.secret)
+		dbUserID := uuid.NullUUID{UUID: id, Valid: true}
+		if err != nil {
+			log.Printf("Unauthorized: %s", err)
+			w.WriteHeader(401)
+			return
+		}
+
 		chirp, err := cfg.dbQueries.Chirp(r.Context(), database.ChirpParams{
 			Body:   params.Body,
-			UserID: params.UserID,
+			UserID: dbUserID,
 		})
 
 		respBody := returnVals{
@@ -302,6 +373,7 @@ func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		fmt.Println(err)
@@ -314,6 +386,7 @@ func main() {
 		fileserverHits: atomic.Int32{},
 		dbQueries:      dbQueries,
 		platform:       platform,
+		secret:         secret,
 	}
 
 	srv := &http.Server{
@@ -343,10 +416,12 @@ func main() {
 
 	// Chirp
 	mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
-	// Get chirps
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirpsHandler)
-	// Get chirp by id
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpHandler)
+
+	// Tokens
+	mux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
+	mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
 
 	log.Printf("Serving on port: %s\n", port)
 	log.Fatal(srv.ListenAndServe())
